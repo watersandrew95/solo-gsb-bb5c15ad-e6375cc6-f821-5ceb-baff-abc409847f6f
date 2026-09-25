@@ -141,6 +141,26 @@ class ReservationOut(BaseModel):
     canceled_at: UtcDatetime | None = None
 
 
+class ForecastImpactPreviewItem(BaseModel):
+    """预演后达标状态发生变化的单条预约。"""
+
+    reservation_id: int
+    current_sufficient: bool = Field(
+        description="按当前预报复核的达标值；预报未覆盖整个通航区间时为 false"
+    )
+    preview_sufficient: bool = Field(
+        description="按临时预报（当前预报合并本批拟录入点后）复核的达标值"
+    )
+
+
+class ForecastImpactPreviewResult(BaseModel):
+    port_id: int
+    changes: list[ForecastImpactPreviewItem] = Field(
+        description="达标状态发生变化的有效预约（仅 ID、原达标值、预演达标值），"
+        "按出发时刻升序；无变化为空列表"
+    )
+
+
 class DepthAuditDeficit(BaseModel):
     start: UtcDatetime = Field(description="欠深时段起点")
     end: UtcDatetime = Field(description="欠深时段终点")

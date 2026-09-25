@@ -14,6 +14,10 @@
   按查询时最新潮高预报与线性插值规则，求允许范围内全程水深达标的最大
   非负吃水（按 0.01 米向下取整）；同一吃水多个可行时刻时返回最早出发及
   通航结束时刻；范围内无可行的 0 米吃水时返回 409。
+- 预报录入影响预演：提交一批拟录入潮高预报点，与库存预报按 UTC 规则合并
+  （同一时刻按提交顺序后者覆盖前者）形成临时预报；对该港口有效预约的固定
+  通航区间分别按当前与临时预报复核全程达标（未覆盖即不达标），仅返回达标
+  状态变化的预约 ID、原达标值与预演达标值；预演只读，不写库、不改预约。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -28,6 +32,8 @@ from .schemas import (
     DepthAuditDeficit,
     DepthAuditResult,
     DepthAuditUncovered,
+    ForecastImpactPreviewItem,
+    ForecastImpactPreviewResult,
     MaxDraftQuery,
     MaxDraftResult,
     PortCreate,
@@ -35,6 +41,7 @@ from .schemas import (
     PortUpdate,
     ReservationCreate,
     ReservationOut,
+    TideForecastPoint,
     TideForecastOut,
     TideForecastUpsert,
     WindowQuery,
@@ -56,7 +63,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +172,45 @@ def _forecast_points(db: Connection, port_id: int) -> list[tuple[datetime, float
         (datetime.fromisoformat(r["forecast_time"]), r["tide_height"])
         for r in rows
     ]
+
+
+def _merge_preview_points(
+    current: list[tuple[datetime, float]],
+    submitted: list[TideForecastPoint],
+) -> list[tuple[datetime, float]]:
+    """当前库存预报与一批拟录入点合并为临时预报（不写库）。
+
+    - 时刻一律按现有 UTC 规则归一化（无时区信息按 UTC，其余换算为 UTC）；
+    - 拟录入点与库存点同一时刻的，拟录入值覆盖库存值；
+    - 拟录入点内部同一时刻的，按提交顺序以后者覆盖前者；
+    - 结果按时刻升序。
+    """
+    merged: dict[datetime, float] = {t: h for t, h in current}
+    for p in submitted:
+        merged[_normalize(p.forecast_time)] = p.tide_height
+    return sorted(merged.items(), key=lambda kv: kv[0])
+
+
+def _sufficient_over_interval(
+    points: list[tuple[datetime, float]],
+    reference_depth: float,
+    required_depth: float,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """按现有线性插值与水深复核规则判定 [start, end] 是否全程达标。
+
+    未被预报覆盖的时段判为不达标（与 depth-audit 的 sufficient 口径一致）。
+    """
+    deficits, uncovered = depth_deficit_audit(
+        points,
+        reference_depth=reference_depth,
+        required_depth=required_depth,
+        start=start,
+        end=end,
+    )
+    return not uncovered and not deficits
+
 
 
 @app.post("/ports/{port_id}/windows", response_model=WindowQueryResult)
@@ -456,3 +502,63 @@ def audit_reservation_depth(reservation_id: int, db: Connection = Depends(get_db
         ],
         sufficient=not uncovered and not deficits,
     )
+
+
+@app.post(
+    "/ports/{port_id}/forecast-impact-preview",
+    response_model=ForecastImpactPreviewResult,
+)
+def forecast_impact_preview(
+    port_id: int, payload: TideForecastUpsert, db: Connection = Depends(get_db)
+):
+    """预报录入影响预演（只读，不写入预报、不改动预约）。
+
+    提交一批**拟录入**的潮高预报点，按现有 UTC 规则与该港口库存预报合并：
+    拟录入点与库存点同一时刻的覆盖库存值，拟录入点内部同一时刻按提交顺序
+    以后者覆盖前者，由此形成临时预报。
+
+    基于**一次读取**的当前预报与该港口**有效预约**，对每条预约的固定通航
+    区间，分别用当前预报与临时预报，按现有线性插值、水深复核规则判定是否
+    全程达标；未被预报覆盖的区间判为不达标。仅返回达标状态发生变化的
+    预约 ID、原达标值与预演达标值，按出发时刻升序；无变化返回空列表。
+    """
+    port = _get_port_or_404(db, port_id)
+    # 当前预报与有效预约各读取一次；随后全部在内存中计算
+    current_points = _forecast_points(db, port_id)
+    preview_points = _merge_preview_points(current_points, payload.points)
+
+    rows = db.execute(
+        "SELECT id, departure_start, departure_end, draft, safety_margin "
+        "FROM reservations WHERE port_id = ? AND status = ? "
+        "ORDER BY departure_start",
+        (port_id, _STATUS_ACTIVE),
+    ).fetchall()
+
+    changes: list[ForecastImpactPreviewItem] = []
+    for row in rows:
+        start = datetime.fromisoformat(row["departure_start"])
+        end = datetime.fromisoformat(row["departure_end"])
+        required_depth = row["draft"] + row["safety_margin"]
+        current_ok = _sufficient_over_interval(
+            current_points,
+            reference_depth=port["reference_depth"],
+            required_depth=required_depth,
+            start=start,
+            end=end,
+        )
+        preview_ok = _sufficient_over_interval(
+            preview_points,
+            reference_depth=port["reference_depth"],
+            required_depth=required_depth,
+            start=start,
+            end=end,
+        )
+        if current_ok != preview_ok:
+            changes.append(
+                ForecastImpactPreviewItem(
+                    reservation_id=row["id"],
+                    current_sufficient=current_ok,
+                    preview_sufficient=preview_ok,
+                )
+            )
+    return ForecastImpactPreviewResult(port_id=port_id, changes=changes)

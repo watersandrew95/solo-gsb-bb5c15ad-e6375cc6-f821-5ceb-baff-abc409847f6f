@@ -558,3 +558,187 @@ def test_max_draft_naive_datetime_treated_as_utc(client):
     r = client.post(f"/ports/{port_id}/max-draft", json=body)
     assert r.status_code == 200
     assert r.json()["max_draft"] == 6.0
+
+
+# ---------------------------------------------------------------------------
+# 预报录入影响预演 POST /ports/{id}/forecast-impact-preview
+# ---------------------------------------------------------------------------
+
+PREVIEW_PATH = "/forecast-impact-preview"
+
+
+def test_impact_preview_reports_flips_and_stays_read_only(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)  # 排定 00:36–01:36，当前全程达标
+
+    # 拟录入：把高潮点 3.0 → 1.0（与 PUT 更正相同的覆盖语义）
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "port_id": port_id,
+        "changes": [
+            {
+                "reservation_id": rid,
+                "current_sufficient": True,
+                "preview_sufficient": False,
+            }
+        ],
+    }
+
+    # 预演只读：库存预报仍是 3 个点且 03:00 仍为 3.0，预约未改动
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert len(forecasts) == 3
+    assert forecasts[1]["tide_height"] == 3.0
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["departure_start"] == "2026-09-24T00:36:00+00:00"
+    # 库存预报未变：实时复核仍达标
+    assert client.get(f"/reservations/{rid}/depth-audit").json()["sufficient"] is True
+
+
+def test_impact_preview_no_change_returns_empty(client):
+    port_id = _setup_port(client)
+    _create_reservation(client, port_id)
+
+    # 拟录入一个不改变达标结论的点（01:00，潮高 2.0：该时刻水深仍远超 5.5）
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={"points": [{"forecast_time": "2026-09-24T01:00:00Z", "tide_height": 2.0}]},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"port_id": port_id, "changes": []}
+
+
+def test_impact_preview_extending_coverage_flips_to_sufficient(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    # 库存预报覆盖收缩（如外部系统清理旧点）：仅剩 00:00 一个点、无插值区间，
+    # 预约通航区间 [00:36, 01:36] 全部未被预报覆盖 → 当前不达标
+    conn = sqlite3.connect(database.DATABASE_PATH)
+    conn.execute(
+        "DELETE FROM tide_forecasts WHERE forecast_time IN (?, ?)",
+        ("2026-09-24T03:00:00+00:00", "2026-09-24T06:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+    audit = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert audit["sufficient"] is False
+    assert audit["coverage_complete"] is False
+
+    # 拟录入恢复 03:00/06:00 两个点：合并后与原始预报一致，覆盖全程且达标 → 翻为 true
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={
+            "points": [
+                {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+                {"forecast_time": "2026-09-24T06:00:00Z", "tide_height": 0.5},
+            ]
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["changes"] == [
+        {
+            "reservation_id": rid,
+            "current_sufficient": False,
+            "preview_sufficient": True,
+        }
+    ]
+    # 预演未把这两个点真正写入：实际复核仍为未覆盖、不达标
+    audit = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert audit["coverage_complete"] is False
+    assert audit["sufficient"] is False
+
+
+def test_impact_preview_same_timestamp_later_submission_wins(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    # 同一时刻提交两个值：3.0（不变）在前、1.0（致欠深）在后，以后者为准
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={
+            "points": [
+                {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+                {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0},
+            ]
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["changes"] == [
+        {
+            "reservation_id": rid,
+            "current_sufficient": True,
+            "preview_sufficient": False,
+        }
+    ]
+
+    # 顺序反过来：1.0 在前、3.0 在后，以后者（与库存一致）为准 → 无变化
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={
+            "points": [
+                {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0},
+                {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+            ]
+        },
+    )
+    assert r.json()["changes"] == []
+
+
+def test_impact_preview_changes_sorted_by_departure(client):
+    port_id = _setup_port(client)
+    # 可出发时段 [00:36, 04:24] 内排 3 条首尾相接的预约：
+    # 00:36–01:36、01:36–02:36、02:36–03:36
+    rids = [_create_reservation(client, port_id) for _ in range(3)]
+
+    # 高潮点预演改为 1.0：[00:36, 05:24] 达标窗口消失，三条全部翻为不达标
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    changes = r.json()["changes"]
+    assert [c["reservation_id"] for c in changes] == rids  # 即按出发时刻升序
+    assert all(c["current_sufficient"] and not c["preview_sufficient"] for c in changes)
+
+    # 取消中间一条后再预演：已取消预约不在结果中
+    client.delete(f"/reservations/{rids[1]}")
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    assert [c["reservation_id"] for c in r.json()["changes"]] == [rids[0], rids[2]]
+
+
+def test_impact_preview_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    # 无时区信息的时刻按 UTC 归一化后覆盖库存 03:00 点
+    r = client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00", "tide_height": 1.0}]},
+    )
+    assert r.status_code == 200
+    assert [c["reservation_id"] for c in r.json()["changes"]] == [rid]
+
+
+def test_impact_preview_validation_and_404(client):
+    port_id = _setup_port(client)
+    _create_reservation(client, port_id)
+
+    # 空批次 → 422
+    assert client.post(
+        f"/ports/{port_id}{PREVIEW_PATH}", json={"points": []}
+    ).status_code == 422
+    # 未知港口 → 404（校验通过后才查港口）
+    assert client.post(
+        "/ports/999/forecast-impact-preview",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    ).status_code == 404
+    # 只读：两次被拒请求后数据不变
+    assert len(client.get(f"/ports/{port_id}/tide-forecasts").json()) == 3
+    assert len(client.get(f"/ports/{port_id}/reservations").json()) == 1
