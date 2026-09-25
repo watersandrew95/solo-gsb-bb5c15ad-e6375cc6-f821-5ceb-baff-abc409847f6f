@@ -21,6 +21,12 @@
   允许范围内全程水深达标的**最大非负吃水**（按 **0.01 米向下取整**）；同一吃水
   有多个可行时刻时返回**最早出发**及**通航结束时刻**；只在预报覆盖的连续时段内
   求解，范围内无可行的 0 米吃水时返回 **409**。
+- **预报影响预演**：`POST /ports/{id}/forecast-impact-preview` 提交一批**拟录入**的
+  潮高预报点，与库存预报按 UTC 规则合并（同一时刻按提交顺序**后者覆盖前者**）形成
+  **临时预报**；基于一次读取的当前预报与该港口**有效预约**，分别用当前与临时预报
+  按线性插值、水深复核规则判定每条预约排定通航区间是否**全程达标**（未被预报覆盖
+  的区间判为不达标）；仅返回**达标状态变化**的预约（按出发时刻升序），预演**只读**，
+  不写入预报、不改动预约。
 
 ## 快速开始（单条命令）
 
@@ -64,6 +70,7 @@ docker compose up --build
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
 | `DELETE` | `/reservations/{id}` | 取消预约（释放航道占用） |
 | `GET` | `/reservations/{id}/depth-audit` | 预约水深复核：按最新预报复算排定通航区间水深（只读） |
+| `POST` | `/ports/{id}/forecast-impact-preview` | 预报影响预演：拟录入预报点对有效预约达标状态的影响（只读） |
 
 ### 完整示例
 
@@ -348,6 +355,49 @@ curl -i -X POST http://localhost:8000/ports/2/max-draft \
 - 返回的 `departure_start` / `departure_end` 是**取整后**最大吃水下的
   最早可行出发与通航结束时刻，可直接用于参考排程。
 
+## 预报影响预演
+
+`POST /ports/{id}/forecast-impact-preview`（服务默认监听 **8000** 端口）在
+**不写库**的前提下预演一批拟录入预报点对现有预约的影响：
+
+- 请求体与 `PUT /ports/{id}/tide-forecasts` 相同（`points` 至少 1 个点，
+  时刻按 UTC 规则解释）；拟录入点与库存预报合并形成**临时预报**——
+  同一时刻按提交顺序**后者覆盖前者**（可更正库存点、新增点，
+  同批重复时刻以最后提交的为准）；
+- 基于**一次读取**的当前预报与该港口**有效预约**（已取消的不参与），
+  对每条预约排定的通航区间分别用**当前预报**与**临时预报**按
+  `GET /reservations/{id}/depth-audit` 相同的线性插值、水深复核规则判定
+  是否**全程达标**——欠深或**预报未覆盖**的区间均判为不达标；
+- 仅返回达标状态**发生变化**的预约（`reservation_id`、原达标值
+  `current_sufficient`、预演达标值 `preview_sufficient`），按出发时刻升序；
+  无变化时返回空列表 `[]`；
+- 预演**只读**：不写入预报点、不改动任何预约；港口不存在返回 404。
+
+```bash
+# 沿用上文示例港（基准水深 4.5 米，潮高 0.5→3.0→0.5，
+# 甲船预约排定 2026-09-24 00:36–01:36，所需水深 5.5 米）：
+# 预演“拟把 03:00 的潮高预报从 3.0 更正为 1.0”会影响哪些预约
+curl -X POST http://localhost:8000/ports/1/forecast-impact-preview \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]}'
+```
+
+响应（预约 1 的通航区间在临时预报下全程欠深，达标状态由达标变为不达标）：
+
+```json
+[
+  {
+    "reservation_id": 1,
+    "current_sufficient": true,
+    "preview_sufficient": false
+  }
+]
+```
+
+预演后库存预报与预约保持不变（可用 `GET /ports/1/tide-forecasts` 与
+`GET /reservations/1/depth-audit` 验证）；若提交的拟录入点不改变任何预约的
+达标状态（例如与当前预报一致），响应为空列表 `[]`。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -362,7 +412,7 @@ pytest                                # 运行全部测试（核心算法 + API 
 ```
 app/
   main.py       # FastAPI 路由与生命周期（启动时初始化数据库）
-  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水
+  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并
   database.py   # SQLite 连接与幂等建表
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

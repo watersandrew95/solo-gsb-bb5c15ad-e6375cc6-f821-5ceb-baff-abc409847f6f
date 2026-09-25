@@ -172,3 +172,25 @@ class DepthAuditResult(BaseModel):
     sufficient: bool = Field(
         description="整个通航区间水深是否均达标；预报覆盖不足时一律为 false"
     )
+
+
+class ForecastImpactPreview(BaseModel):
+    """预报影响预演请求：一批拟录入的潮高预报点。
+
+    与库存预报按 UTC 规则合并（同一时刻按提交顺序后者覆盖前者）形成
+    临时预报，仅用于预演判定，不写入数据库。
+    """
+
+    points: list[TideForecastPoint] = Field(min_length=1)
+
+
+class ForecastImpactChange(BaseModel):
+    """一条预约在预演前后的达标状态变化（仅状态发生变化的预约才会返回）。"""
+
+    reservation_id: int = Field(description="达标状态发生变化的预约 ID")
+    current_sufficient: bool = Field(
+        description="按当前库存预报判定：排定通航区间是否全程水深达标"
+    )
+    preview_sufficient: bool = Field(
+        description="按合并后临时预报判定：排定通航区间是否全程水深达标"
+    )

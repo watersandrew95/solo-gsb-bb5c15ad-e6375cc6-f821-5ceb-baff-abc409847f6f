@@ -11,6 +11,8 @@
 - 最大可通航吃水：在允许出发范围内，对“所需水深 = 吃水 + 安全富余”二分搜索，
   复用达标窗口/可出发时段规则判定可行性，求允许范围内全程水深达标所能支持的
   最大所需水深；吃水 = 最大所需水深 − 安全富余，由调用方按 0.01 米向下取整。
+- 预报影响预演：拟录入的预报点与当前预报按“同一时刻后者覆盖前者”合并成
+  临时预报，复用 depth_deficit_audit 分别判定全程达标与否（纯内存计算）。
 """
 from __future__ import annotations
 
@@ -216,6 +218,24 @@ def earliest_scheduled_departure(
     if not candidates:
         return None
     return _to_utc(min(lo for lo, _ in candidates))
+
+
+def merge_forecast_points(
+    current: list[ForecastPoint],
+    submitted: list[ForecastPoint],
+) -> list[ForecastPoint]:
+    """合并当前预报与一批拟录入的预报点，形成临时预报（纯内存，不写库）。
+
+    同一时刻按提交顺序以后者覆盖前者：先放入当前预报，再按提交顺序
+    依次覆盖，因此拟录入点可更正当前值，同批重复时刻以最后提交为准。
+    返回按时刻升序的 (时刻, 潮高) 列表。
+    """
+    merged: dict[datetime, float] = {}
+    for t, h in current:
+        merged[t] = h
+    for t, h in submitted:
+        merged[t] = h
+    return sorted(merged.items(), key=lambda kv: kv[0])
 
 
 def depth_deficit_audit(

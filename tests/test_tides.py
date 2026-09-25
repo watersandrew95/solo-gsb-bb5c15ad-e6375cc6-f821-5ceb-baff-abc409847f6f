@@ -7,6 +7,7 @@ from app.tides import (
     earliest_feasible_departure,
     earliest_scheduled_departure,
     max_supported_required_depth,
+    merge_forecast_points,
     sufficient_depth_windows,
 )
 
@@ -404,3 +405,25 @@ def test_max_supported_required_depth_duration_exceeds_coverage():
         allowed_start=BASE, allowed_end=BASE + timedelta(hours=1),
     )
     assert departure is None
+
+
+def test_merge_forecast_points_later_submission_overrides():
+    # 当前预报 3 个点；拟录入点更正 01:00、新增 03:00，
+    # 且同批 02:00 重复提交 → 以最后提交的值为准
+    current = pts(1.0, 2.0, 3.0)
+    submitted = [
+        (BASE + timedelta(hours=1), 2.5),   # 更正现有点
+        (BASE + timedelta(hours=3), 4.0),   # 新增点
+        (BASE + timedelta(hours=2), 9.9),   # 同批先提交
+        (BASE + timedelta(hours=2), 3.5),   # 同批后提交，覆盖前者
+    ]
+    merged = merge_forecast_points(current, submitted)
+    assert merged == [
+        (BASE, 1.0),
+        (BASE + timedelta(hours=1), 2.5),
+        (BASE + timedelta(hours=2), 3.5),
+        (BASE + timedelta(hours=3), 4.0),
+    ]
+    # 纯内存合并：入参不被修改
+    assert current == pts(1.0, 2.0, 3.0)
+    assert len(submitted) == 4

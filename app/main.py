@@ -14,6 +14,11 @@
   按查询时最新潮高预报与线性插值规则，求允许范围内全程水深达标的最大
   非负吃水（按 0.01 米向下取整）；同一吃水多个可行时刻时返回最早出发及
   通航结束时刻；范围内无可行的 0 米吃水时返回 409。
+- 预报影响预演：提交一批拟录入的潮高预报点，与库存预报合并（同一时刻按
+  提交顺序后者覆盖前者）形成临时预报；基于一次读取的当前预报与该港口
+  有效预约，分别用当前与临时预报按现有线性插值、水深复核规则判定每条
+  预约排定通航区间是否全程达标（未被预报覆盖的区间判为不达标），仅返回
+  达标状态变化的预约；预演只读，不写入预报、不改动预约。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -28,6 +33,8 @@ from .schemas import (
     DepthAuditDeficit,
     DepthAuditResult,
     DepthAuditUncovered,
+    ForecastImpactChange,
+    ForecastImpactPreview,
     MaxDraftQuery,
     MaxDraftResult,
     PortCreate,
@@ -46,6 +53,7 @@ from .tides import (
     earliest_feasible_departure,
     earliest_scheduled_departure,
     max_supported_required_depth,
+    merge_forecast_points,
 )
 
 @asynccontextmanager
@@ -56,7 +64,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -456,3 +464,60 @@ def audit_reservation_depth(reservation_id: int, db: Connection = Depends(get_db
         ],
         sufficient=not uncovered and not deficits,
     )
+
+
+# ---------------------------------------------------------------------------
+# 预报影响预演
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/ports/{port_id}/forecast-impact-preview",
+    response_model=list[ForecastImpactChange],
+)
+def preview_forecast_impact(
+    port_id: int, payload: ForecastImpactPreview, db: Connection = Depends(get_db)
+):
+    """预报影响预演（只读：不写入预报、不改动预约）。
+
+    提交一批拟录入的潮高预报点，按 UTC 规则与库存预报合并（同一时刻按
+    提交顺序后者覆盖前者）形成临时预报；基于一次读取的当前预报与该港口
+    有效预约，对每条预约排定的通航区间分别用当前与临时预报按现有线性
+    插值、水深复核规则判定是否全程达标（未被预报覆盖的区间判为不达标）。
+    仅返回达标状态发生变化的预约，按出发时刻升序；无变化时返回空列表。
+    """
+    port = _get_port_or_404(db, port_id)
+    # 一次读取：当前预报点 + 该港口全部有效预约
+    current_points = _forecast_points(db, port_id)
+    rows = db.execute(
+        "SELECT id, draft, safety_margin, departure_start, departure_end "
+        "FROM reservations WHERE port_id = ? AND status = ? "
+        "ORDER BY departure_start, id",
+        (port_id, _STATUS_ACTIVE),
+    ).fetchall()
+
+    submitted = [(_normalize(p.forecast_time), p.tide_height) for p in payload.points]
+    preview_points = merge_forecast_points(current_points, submitted)
+
+    changes: list[ForecastImpactChange] = []
+    for row in rows:
+        required_depth = row["draft"] + row["safety_margin"]
+        start = datetime.fromisoformat(row["departure_start"])
+        end = datetime.fromisoformat(row["departure_end"])
+        cur_deficits, cur_uncovered = depth_deficit_audit(
+            current_points, port["reference_depth"], required_depth, start, end
+        )
+        new_deficits, new_uncovered = depth_deficit_audit(
+            preview_points, port["reference_depth"], required_depth, start, end
+        )
+        current_ok = not cur_deficits and not cur_uncovered
+        preview_ok = not new_deficits and not new_uncovered
+        if current_ok != preview_ok:
+            changes.append(
+                ForecastImpactChange(
+                    reservation_id=row["id"],
+                    current_sufficient=current_ok,
+                    preview_sufficient=preview_ok,
+                )
+            )
+    return changes
